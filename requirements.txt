@@ -1,0 +1,14 @@
+# Dependências do sistema de detecção de gestos
+# Instalar com: pip install -r requirements.txt
+
+# Visão computacional
+opencv-python>=4.8
+
+# Inferência ONNX Runtime
+# CPU only:
+onnxruntime>=1.18
+# GPU (Jetson / CUDA) — instalar UM dos dois, não ambos:
+# onnxruntime-gpu>=1.18
+
+# Álgebra linear (geralmente já disponível)
+numpy>=1.24
