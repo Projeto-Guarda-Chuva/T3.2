@@ -1,8 +1,9 @@
+# frame_interface.py (substituído completamente)
 """
-Interface de Frames — Grupo 1
-==============================
-Captura frames do servidor HTTP MJPEG e os envia via named pipe
-para o processo de inferência (Grupo 2).
+Interface de Frames — Grupo 1 (Câmera Local)
+===============================================
+Captura frames da câmera local conectada à Jetson Orin Nano
+e os envia via named pipe para o processo de inferência (Grupo 2).
 
 Protocolo do pipe:
     [4 bytes: magic 0x47525544]
@@ -26,8 +27,10 @@ import numpy as np
 # Adicionar o diretório do pacote ao path
 sys.path.insert(0, os.path.dirname(__file__))
 
-from config import HTTP_URL, PIPE_PATH, FPS_LIMIT
-from http_stream import HTTPVideoStream
+from config import (
+    PIPE_PATH, FPS_LIMIT,
+    CAMERA_DEVICE, CAMERA_WIDTH, CAMERA_HEIGHT, CAMERA_FPS, CAMERA_BUFFERSIZE,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -39,7 +42,6 @@ log = logging.getLogger("frame_interface")
 FRAME_MAGIC        = 0x47525544
 HEADER_FORMAT      = "<IIIII Q"       # magic, frame_id, w, h, channels, timestamp_us
 HEADER_SIZE        = struct.calcsize(HEADER_FORMAT)
-MAX_PIPE_BUFFER    = 10               # frames máximos no pipe antes de throttle
 MAX_CONSEC_ERRORS  = 10
 
 
@@ -62,10 +64,52 @@ def create_pipe(path: str) -> None:
     log.info("Pipe criado: %s", path)
 
 
+def init_camera(device: int, width: int, height: int, fps: int) -> cv2.VideoCapture:
+    """
+    Inicializa a câmera com as configurações otimizadas para Jetson.
+    """
+    # Tentar usar GStreamer para melhor performance no Jetson
+    # Caso não funcione, fallback para V4L2
+    try:
+        # Pipeline GStreamer otimizado para Jetson
+        gst_pipeline = (
+            f"v4l2src device=/dev/video{device} ! "
+            f"video/x-raw,width={width},height={height},framerate={fps}/1 ! "
+            "nvvidconv ! "
+            "video/x-raw,format=BGRx ! "
+            "videoconvert ! "
+            "video/x-raw,format=BGR ! "
+            "appsink drop=1 max-buffers=1"
+        )
+        cap = cv2.VideoCapture(gst_pipeline, cv2.CAP_GSTREAMER)
+        if cap.isOpened():
+            log.info("Câmera inicializada com GStreamer: /dev/video%d", device)
+            return cap
+    except Exception as e:
+        log.warning("Falha ao inicializar GStreamer: %s", e)
+
+    # Fallback para V4L2 (OpenCV padrão)
+    cap = cv2.VideoCapture(device)
+    if not cap.isOpened():
+        raise RuntimeError(f"Não foi possível abrir a câmera /dev/video{device}")
+
+    # Configurações otimizadas
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+    cap.set(cv2.CAP_PROP_FPS, fps)
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, CAMERA_BUFFERSIZE)
+    # Desativar auto-exposição para menor latência (opcional)
+    # cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 1)
+
+    log.info("Câmera inicializada com V4L2: /dev/video%d", device)
+    return cap
+
+
 # ── Loop principal ───────────────────────────────────────────────────────────
 
-def run(http_url: str = HTTP_URL, pipe_path: str = PIPE_PATH,
-        fps_limit: int = FPS_LIMIT) -> int:
+def run(pipe_path: str = PIPE_PATH,
+        fps_limit: int = FPS_LIMIT,
+        camera_device: int = CAMERA_DEVICE) -> int:
     running    = True
     frame_id   = 0
     errors     = 0
@@ -82,8 +126,9 @@ def run(http_url: str = HTTP_URL, pipe_path: str = PIPE_PATH,
     signal.signal(signal.SIGTERM, _shutdown)
     signal.signal(signal.SIGPIPE, signal.SIG_IGN)
 
-    log.info("URL: %s", http_url)
     log.info("Pipe: %s", pipe_path)
+    log.info("Câmera: /dev/video%d (%dx%d @ %d fps)",
+             camera_device, CAMERA_WIDTH, CAMERA_HEIGHT, CAMERA_FPS)
 
     # Criar pipe e aguardar o Grupo 2 abrir a leitura
     create_pipe(pipe_path)
@@ -91,26 +136,30 @@ def run(http_url: str = HTTP_URL, pipe_path: str = PIPE_PATH,
     pipe_fd = os.open(pipe_path, os.O_WRONLY)  # bloqueia até o leitor conectar
     log.info("Grupo 2 conectado!")
 
-    stream = HTTPVideoStream(http_url)
-    if not stream.connect():
-        log.error("Falha ao conectar ao servidor HTTP")
+    # Inicializar câmera
+    try:
+        cap = init_camera(camera_device, CAMERA_WIDTH, CAMERA_HEIGHT, CAMERA_FPS)
+    except RuntimeError as e:
+        log.error("%s", e)
         os.close(pipe_fd)
         return 1
-    log.info("Stream HTTP conectado")
+
+    log.info("Captura iniciada")
 
     try:
         while running:
             t_loop = time.monotonic()
 
-            frame = stream.read()
+            # Ler frame da câmera
+            ret, frame = cap.read()
 
-            if frame is None:
+            if not ret or frame is None:
                 errors += 1
                 log.warning("Frame vazio (%d/%d)", errors, MAX_CONSEC_ERRORS)
                 if errors >= MAX_CONSEC_ERRORS:
                     log.error("Muitos erros consecutivos — encerrando")
                     break
-                time.sleep(0.1)
+                time.sleep(0.05)
                 continue
 
             errors    = 0
@@ -142,7 +191,7 @@ def run(http_url: str = HTTP_URL, pipe_path: str = PIPE_PATH,
                 time.sleep(sleep_for)
 
     finally:
-        stream.disconnect()
+        cap.release()
         os.close(pipe_fd)
         try:
             os.unlink(pipe_path)
