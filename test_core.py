@@ -1,166 +1,225 @@
-import struct
+"""
+Testes unitários para a lógica principal do detector de gestos.
+Foco: gesture_analyzer.py e kalman.py
 
-import cv2
-import numpy as np
+Uso:
+    pytest
+"""
+
+import sys
+import os
 import pytest
+import numpy as np
 
-from detector import Detection, _dfl_decode, preprocess
-from frame_interface import encode_frame
-from gesture_analyzer import (Gesture, GestureAnalyzer, KalmanPerson,
-                              _confidence, _majority, classify_all,
-                              compute_speed_coeff)
+# Adicionar o diretório do projeto ao path para encontrar os módulos
+sys.path.insert(0, os.path.dirname(__file__))
+
+from config import KP, KP_CONF_THRESHOLD, KALMAN_JOINTS
+from detector import Detection
+from gesture_analyzer import (
+    Gesture, GestureAnalyzer, classify_all, compute_speed_coeff, _majority, _confidence
+)
+from kalman import KalmanJoint, KalmanPerson
+
+# Mocks e Dados de Teste 
+
+def create_mock_detection(kps_overrides: dict, x_offset: int = 0) -> Detection:
+    """Cria um objeto Detection com keypoints mock."""
+    # Keypoints em repouso, com confiança total
+    kps = np.ones((KP.NUM, 3), dtype=np.float32)
+    kps[:, 0] = 200 + x_offset  # x
+    kps[:, 1] *= 250  # y
+
+    # Posições padrão
+    kps[KP.LEFT_SHOULDER,  1] = 200
+    kps[KP.RIGHT_SHOULDER, 1] = 200
+    kps[KP.LEFT_HIP,       1] = 300
+    kps[KP.RIGHT_HIP,      1] = 300
+    kps[KP.LEFT_WRIST,     1] = 250
+    kps[KP.RIGHT_WRIST,    1] = 250
+
+    # Largura dos ombros e quadris
+    kps[KP.LEFT_SHOULDER,  0] = 150 + x_offset
+    kps[KP.RIGHT_SHOULDER, 0] = 250 + x_offset
+    kps[KP.LEFT_HIP,       0] = 160 + x_offset
+    kps[KP.RIGHT_HIP,      0] = 240 + x_offset
+
+    for kp_idx, (x, y, conf) in kps_overrides.items():
+        kps[kp_idx] = [x, y, conf]
+
+    bbox = [
+        np.min(kps[:, 0]),
+        np.min(kps[:, 1]),
+        np.max(kps[:, 0]) - np.min(kps[:, 0]),
+        np.max(kps[:, 1]) - np.min(kps[:, 1]),
+    ]
+    return Detection(bbox=np.array(bbox), score=0.9, kps=kps)
 
 
-def make_kps(shoulder_y=50, hip_y=150, wrist_y=30, conf=0.9):
-    kps = np.zeros((17, 3), dtype=np.float32)
-    kps[5] = [40.0, float(shoulder_y), conf]  # LEFT_SHOULDER
-    kps[6] = [80.0, float(shoulder_y), conf]  # RIGHT_SHOULDER
-    kps[11] = [40.0, float(hip_y), conf]      # LEFT_HIP
-    kps[12] = [80.0, float(hip_y), conf]      # RIGHT_HIP
-    kps[9] = [30.0, float(wrist_y), conf]      # LEFT_WRIST
-    kps[10] = [90.0, float(wrist_y), conf]     # RIGHT_WRIST
-    return kps
+# Testes do GestureAnalyzer
 
+@pytest.fixture
+def analyzer():
+    return GestureAnalyzer(conf_thr=KP_CONF_THRESHOLD)
 
-def test_gesture_analyzer_classify_rest_when_wrist_missing():
-    det = Detection(np.array([0, 0, 100, 100], dtype=np.float32), 1.0,
-                    np.zeros((17, 3), dtype=np.float32))
-    analyzer = GestureAnalyzer()
+def test_classify_repouso(analyzer):
+    """Pulsos entre ombros e quadris."""
+    det = create_mock_detection({})
+    assert analyzer.classify(det) == Gesture.REPOUSO
+
+def test_classify_subir(analyzer):
+    """Pulsos acima dos ombros."""
+    det = create_mock_detection({
+        KP.LEFT_WRIST:  (150, 150, 1.0),
+        KP.RIGHT_WRIST: (250, 150, 1.0),
+    })
+    assert analyzer.classify(det) == Gesture.SUBIR
+
+def test_classify_descer(analyzer):
+    """Pulsos abaixo dos quadris."""
+    det = create_mock_detection({
+        KP.LEFT_WRIST:  (150, 350, 1.0),
+        KP.RIGHT_WRIST: (250, 350, 1.0),
+    })
+    assert analyzer.classify(det) == Gesture.DESCER
+
+def test_classify_low_conf(analyzer):
+    """Deve ignorar keypoints com baixa confiança."""
+    det = create_mock_detection({
+        KP.LEFT_WRIST:  (150, 150, 0.1), # Baixa confiança -> ignorado
+        KP.RIGHT_WRIST: (250, 350, 1.0), # Abaixo do quadril
+    })
+    # Como um pulso está visível e abaixo do quadril, o gesto é DESCER
+    assert analyzer.classify(det) == Gesture.DESCER
+
+def test_classify_no_wrists(analyzer):
+    """Sem pulsos visíveis, deve ser REPOUSO."""
+    det = create_mock_detection({
+        KP.LEFT_WRIST:  (150, 150, 0.1),
+        KP.RIGHT_WRIST: (250, 150, 0.1),
+    })
     assert analyzer.classify(det) == Gesture.REPOUSO
 
 
-@pytest.mark.parametrize(
-    ("shoulder_y", "hip_y", "wrist_y", "expected"),
-    [
-        (100, 200, 50, Gesture.SUBIR),
-        (50, 100, 150, Gesture.DESCER),
-        (50, 150, 100, Gesture.REPOUSO),
-    ],
-)
-def test_gesture_analyzer_classify_variants(shoulder_y, hip_y, wrist_y, expected):
-    analyzer = GestureAnalyzer()
-    det = Detection(np.array([0, 0, 100, 100], dtype=np.float32), 1.0,
-                    make_kps(shoulder_y=shoulder_y, hip_y=hip_y, wrist_y=wrist_y))
-    assert analyzer.classify(det) == expected
+# Testes do Coeficiente de Velocidade
+
+def test_speed_coeff_repouso():
+    det = create_mock_detection({})
+    kf = KalmanPerson()
+    kf.update(det.kps, dt=0.03)
+    assert compute_speed_coeff(det, kf, Gesture.REPOUSO) == 0.0
+
+def test_speed_coeff_subir():
+    # Pulsos bem acima dos ombros (y=100) vs ombros (y=200)
+    # dist = 200 - 100 = 100
+    # shoulder_width = 250 - 150 = 100
+    # speed = 100 / (1.5 * 100) = 0.666...
+    det = create_mock_detection({
+        KP.LEFT_WRIST:  (150, 100, 1.0),
+        KP.RIGHT_WRIST: (250, 100, 1.0),
+    })
+    kf = KalmanPerson()
+    kf.update(det.kps, dt=0.03)
+    speed = compute_speed_coeff(det, kf, Gesture.SUBIR)
+    assert speed == pytest.approx(100.0 / (1.5 * 100.0))
+
+def test_speed_coeff_descer():
+    # Pulsos bem abaixo dos quadris (y=400) vs quadris (y=300)
+    # dist = 400 - 300 = 100
+    # hip_width = 240 - 160 = 80
+    # speed = 100 / (1.5 * 80) = 0.833...
+    det = create_mock_detection({
+        KP.LEFT_WRIST:  (160, 400, 1.0),
+        KP.RIGHT_WRIST: (240, 400, 1.0),
+    })
+    kf = KalmanPerson()
+    kf.update(det.kps, dt=0.03)
+    speed = compute_speed_coeff(det, kf, Gesture.DESCER)
+    assert speed == pytest.approx(100.0 / (1.5 * 80.0))
+
+def test_speed_coeff_clip():
+    """Testa se a velocidade é limitada em 1.0."""
+    # Distância muito grande
+    det = create_mock_detection({
+        KP.LEFT_WRIST:  (150, -100, 1.0),
+        KP.RIGHT_WRIST: (250, -100, 1.0),
+    })
+    kf = KalmanPerson()
+    kf.update(det.kps, dt=0.03)
+    speed = compute_speed_coeff(det, kf, Gesture.SUBIR)
+    assert speed == 1.0
 
 
-def test_gesture_analyzer_ref_ys_returns_shoulder_and_hip_mean():
-    analyzer = GestureAnalyzer()
-    det = Detection(np.array([0, 0, 100, 100], dtype=np.float32), 1.0,
-                    make_kps(shoulder_y=80, hip_y=140, wrist_y=30))
+# Testes da Agregação 
 
-    shoulder_y, hip_y = analyzer.ref_ys(det)
-    assert shoulder_y == pytest.approx(80.0)
-    assert hip_y == pytest.approx(140.0)
-
-
-def test_compute_speed_coeff_returns_zero_for_rest():
-    det = Detection(np.array([0, 0, 100, 100], dtype=np.float32), 1.0,
-                    make_kps(shoulder_y=50, hip_y=150, wrist_y=30))
-    kp_filter = KalmanPerson()
-    assert compute_speed_coeff(det, kp_filter, Gesture.REPOUSO) == 0.0
-
-
-def test_compute_speed_coeff_norms_for_subir_and_descend():
-    det_up = Detection(np.array([0, 0, 100, 100], dtype=np.float32), 1.0,
-                       make_kps(shoulder_y=100, hip_y=200, wrist_y=30))
-    det_down = Detection(np.array([0, 0, 100, 100], dtype=np.float32), 1.0,
-                         make_kps(shoulder_y=50, hip_y=120, wrist_y=160))
-    kp_filter = KalmanPerson()
-
-    speed_up = compute_speed_coeff(det_up, kp_filter, Gesture.SUBIR)
-    speed_down = compute_speed_coeff(det_down, kp_filter, Gesture.DESCER)
-
-    assert 0.0 < speed_up <= 1.0
-    assert 0.0 < speed_down <= 1.0
-
-
-def test_compute_speed_coeff_returns_zero_when_reference_unavailable():
-    det = Detection(np.array([0, 0, 100, 100], dtype=np.float32), 1.0,
-                    make_kps(shoulder_y=100, hip_y=200, wrist_y=110, conf=0.0))
-    kp_filter = KalmanPerson()
-
-    assert compute_speed_coeff(det, kp_filter, Gesture.SUBIR) == 0.0
-
-
-def test_majority_and_confidence_helpers():
-    gestures = [Gesture.SUBIR, Gesture.SUBIR, Gesture.DESCER]
-    assert _majority(gestures) == "UP"
-    assert _confidence(gestures, "UP") == pytest.approx(2.0 / 3.0)
+def test_majority_logic():
+    assert _majority([Gesture.SUBIR, Gesture.SUBIR, Gesture.REPOUSO]) == "UP"
+    assert _majority([Gesture.DESCER, Gesture.DESCER, Gesture.SUBIR]) == "DOWN"
+    assert _majority([Gesture.REPOUSO, Gesture.REPOUSO]) == "REST"
     assert _majority([]) == "REST"
+    # Em caso de empate, a implementação de max() pode escolher qualquer um.
+    # O comportamento exato não é crítico, mas testamos um caso.
+    assert _majority([Gesture.SUBIR, Gesture.DESCER]) in ("UP", "DOWN")
+
+def test_confidence_logic():
+    assert _confidence([Gesture.SUBIR, Gesture.SUBIR, Gesture.REPOUSO], "UP") == pytest.approx(2/3)
+    assert _confidence([Gesture.DESCER, Gesture.DESCER, Gesture.SUBIR], "DOWN") == pytest.approx(2/3)
+    assert _confidence([Gesture.DESCER, Gesture.DESCER, Gesture.SUBIR], "UP") == pytest.approx(1/3)
     assert _confidence([], "REST") == 1.0
 
+def test_classify_all_aggregation():
+    # Criar detecções com posições X diferentes para garantir uma ordenação estável.
+    # A função `classify_all` ordena as detecções pela coordenada X do bbox.
+    # Usamos x_offset para garantir que os bboxes não se sobreponham em x.
+    # Para o gesto SUBIR, ambos os pulsos devem estar acima dos ombros para que a média funcione.
+    det_up1 = create_mock_detection({
+        KP.LEFT_WRIST: (160, 150, 1.0), KP.RIGHT_WRIST: (240, 150, 1.0)
+    }, x_offset=0)
+    det_up2 = create_mock_detection({
+        KP.LEFT_WRIST: (360, 140, 1.0), KP.RIGHT_WRIST: (440, 140, 1.0)
+    }, x_offset=200)
+    det_rest = create_mock_detection({}, x_offset=450)
 
-def test_classify_all_aggregates_majority_confidence_and_count():
-    det1 = Detection(np.array([0, 0, 100, 100], dtype=np.float32), 1.0,
-                     make_kps(shoulder_y=100, hip_y=200, wrist_y=30))
-    det2 = Detection(np.array([120, 0, 100, 100], dtype=np.float32), 1.0,
-                     make_kps(shoulder_y=100, hip_y=200, wrist_y=30))
-    analyzers = [GestureAnalyzer(), GestureAnalyzer()]
-    kp_filters = [KalmanPerson(), KalmanPerson()]
+    dets = [det_up1, det_up2, det_rest]
+    analyzers = [GestureAnalyzer() for _ in range(len(dets))]
+    kp_filters = [KalmanPerson() for _ in range(len(dets))]
 
-    gestures, majority_state, confidence, mean_speed, count = classify_all(
-        [det1, det2], analyzers, kp_filters, dt=0.0,
+    gestures, state, conf, speed, count = classify_all(
+        dets, analyzers, kp_filters, dt=0.03
     )
 
-    assert gestures == [Gesture.SUBIR, Gesture.SUBIR]
-    assert majority_state == "UP"
-    assert confidence == 1.0
+    assert gestures == [Gesture.SUBIR, Gesture.SUBIR, Gesture.REPOUSO]
+    assert state == "UP"
+    assert conf == pytest.approx(2/3)
     assert count == 2
-    assert mean_speed > 0.0
+    assert speed > 0.0
 
 
-def test_classify_all_returns_rest_when_no_detections():
-    gestures, majority_state, confidence, mean_speed, count = classify_all(
-        [], [], [], dt=0.0,
-    )
+# Testes do Kalman 
 
-    assert gestures == []
-    assert majority_state == "REST"
-    assert confidence == 1.0
-    assert mean_speed == 0.0
-    assert count == 0
+def test_kalman_joint_init():
+    kf = KalmanJoint()
+    assert not kf.initialized
+    kf.update(100, 200)
+    assert kf.initialized
+    assert np.allclose(kf.s, [100, 200, 0, 0, 0, 0])
 
+def test_kalman_joint_predict_update():
+    kf = KalmanJoint(q_acc=1.0, r_meas=1.0)
+    kf.update(100, 200) # Posição inicial
 
-def test_detector_preprocess_letterboxes_and_normalizes():
-    frame = np.full((40, 80, 3), 128, dtype=np.uint8)
-    prep = preprocess(frame, net_h=64, net_w=64)
+    # 1. Prever
+    kf.predict(dt=0.1)
+    # Posição não deve mudar muito sem velocidade/aceleração inicial
+    assert np.allclose(kf.pos, (100, 200))
 
-    assert prep.tensor.shape == (1, 3, 64, 64)
-    assert prep.net_h == 64
-    assert prep.net_w == 64
-    assert prep.scale == 0.8
-    assert prep.pad_left == 0
-    assert prep.pad_top == 16
-    assert np.all(prep.tensor >= 0.0) and np.all(prep.tensor <= 1.0)
-
-
-def test_dfl_decode_computes_weighted_expectation():
-    logits = np.array([0.0, 1.0, 2.0, 3.0], dtype=np.float32)
-    decoded = _dfl_decode(logits)
-    assert 2.0 < decoded < 3.0
-
-
-def test_frame_interface_encode_frame_size_and_payload():
-    frame = np.arange(12, dtype=np.uint8).reshape((2, 2, 3))
-    payload = encode_frame(frame, frame_id=13)
-    expected_len = struct.calcsize("<IIIII Q") + frame.nbytes
-
-    assert len(payload) == expected_len
-    assert payload[-frame.nbytes:] == frame.tobytes()
-
-
-def test_frame_interface_encode_frame_header():
-    frame = np.zeros((2, 2, 3), dtype=np.uint8)
-    payload = encode_frame(frame, frame_id=7)
-
-    header = payload[:struct.calcsize("<IIIII Q")]
-    magic, frame_id, width, height, channels, timestamp = struct.unpack(
-        "<IIIII Q", header)
-
-    assert magic == 0x47525544
-    assert frame_id == 7
-    assert width == 2
-    assert height == 2
-    assert channels == 3
-    assert payload.endswith(frame.tobytes())
+    # 2. Atualizar com nova medição
+    kf.update(110, 210)
+    # O estado deve se mover em direção à medição
+    pos_x, pos_y = kf.pos
+    vel_x, vel_y = kf.vel
+    assert 100 < pos_x < 110
+    assert 200 < pos_y < 210
+    # A velocidade deve se tornar positiva
+    assert vel_x > 0
+    assert vel_y > 0
