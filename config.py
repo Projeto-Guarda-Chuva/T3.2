@@ -1,3 +1,4 @@
+# config.py (modificado)
 """
 Configurações centralizadas do sistema de detecção de gestos.
 Altere aqui para ajustar comportamento sem tocar na lógica.
@@ -6,11 +7,18 @@ Altere aqui para ajustar comportamento sem tocar na lógica.
 # ── Rede / pipeline ────────────────────────────────────────────────────────
 PIPE_PATH            = "/tmp/gesture_frame_pipe"
 STATE_FILE           = "/tmp/gesture_state.json"
-HTTP_URL             = "http://100.88.0.12:5000"
+HTTP_URL             = "http://100.88.0.12:5000"  # Mantido por compatibilidade
 FPS_LIMIT            = 30
 FRAME_QUEUE_MAX_SIZE = 3
 READ_TIMEOUT_MS      = 1000        # timeout de leitura do pipe (ms)
 STATE_UPDATE_INTERVAL = 0.050      # intervalo de escrita do JSON (segundos)
+
+# ── Câmera local (Jetson Orin Nano) ──────────────────────────────────────
+CAMERA_DEVICE        = 0           # 0 = /dev/video0, 1 = /dev/video1, etc.
+CAMERA_WIDTH         = 1280        # Largura de captura
+CAMERA_HEIGHT        = 720         # Altura de captura
+CAMERA_FPS           = 30          # FPS de captura
+CAMERA_BUFFERSIZE    = 1           # Buffer mínimo para baixa latência
 
 # ── Detecção / NMS ─────────────────────────────────────────────────────────
 CONF_THRESHOLD = 0.40              # confiança mínima de detecção
