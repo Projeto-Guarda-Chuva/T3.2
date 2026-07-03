@@ -2,7 +2,7 @@
 
 # Resultado dos testes
 
-[![Status do QA Central](https://github.com/Projeto-Guarda-Chuva/.github/actions/workflows/qa-t32.yml/badge.svg)](https://github.com/Projeto-Guarda-Chuva/.github/actions)
+[![Status do QA Central](https://github.com/Projeto-Guarda-Chuva/.github/actions/workflows/qa-t32.yml/badge.svg)](https://github.com/Projeto-Guarda-Chuva/.github/actions/workflows/qa-t32.yml)
 
 # Detector de Gestos com YOLOv8-Pose
 
