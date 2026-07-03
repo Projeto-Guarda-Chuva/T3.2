@@ -1,14 +1,7 @@
-"""
-Testes unitários para a lógica principal do detector de gestos.
-Foco: gesture_analyzer.py e kalman.py
-
-Uso:
-    pytest
-"""
-
 import sys
 import os
 import pytest
+import json
 import numpy as np
 
 # Adicionar o diretório do projeto ao path para encontrar os módulos
@@ -21,16 +14,20 @@ from gesture_analyzer import (
 )
 from kalman import KalmanJoint, KalmanPerson
 
-# Mocks e Dados de Teste 
+# --- Carregamento dos Casos de Teste ---
+
+def load_test_cases():
+    path = os.path.join(os.path.dirname(__file__), "tests", "test_cases.json")
+    with open(path, 'r') as f:
+        return json.load(f)
+
+TEST_CASES = load_test_cases()
 
 def create_mock_detection(kps_overrides: dict, x_offset: int = 0) -> Detection:
-    """Cria um objeto Detection com keypoints mock."""
-    # Keypoints em repouso, com confiança total
     kps = np.ones((KP.NUM, 3), dtype=np.float32)
     kps[:, 0] = 200 + x_offset  # x
     kps[:, 1] *= 250  # y
 
-    # Posições padrão
     kps[KP.LEFT_SHOULDER,  1] = 200
     kps[KP.RIGHT_SHOULDER, 1] = 200
     kps[KP.LEFT_HIP,       1] = 300
@@ -38,13 +35,13 @@ def create_mock_detection(kps_overrides: dict, x_offset: int = 0) -> Detection:
     kps[KP.LEFT_WRIST,     1] = 250
     kps[KP.RIGHT_WRIST,    1] = 250
 
-    # Largura dos ombros e quadris
     kps[KP.LEFT_SHOULDER,  0] = 150 + x_offset
     kps[KP.RIGHT_SHOULDER, 0] = 250 + x_offset
     kps[KP.LEFT_HIP,       0] = 160 + x_offset
     kps[KP.RIGHT_HIP,      0] = 240 + x_offset
 
-    for kp_idx, (x, y, conf) in kps_overrides.items():
+    for kp_idx_str, (x, y, conf) in kps_overrides.items():
+        kp_idx = int(kp_idx_str)
         kps[kp_idx] = [x, y, conf]
 
     bbox = [
@@ -56,101 +53,41 @@ def create_mock_detection(kps_overrides: dict, x_offset: int = 0) -> Detection:
     return Detection(bbox=np.array(bbox), score=0.9, kps=kps)
 
 
-# Testes do GestureAnalyzer
+# --- Testes Parametrizados ---
 
 @pytest.fixture
 def analyzer():
     return GestureAnalyzer(conf_thr=KP_CONF_THRESHOLD)
 
-def test_classify_repouso(analyzer):
-    """Pulsos entre ombros e quadris."""
-    det = create_mock_detection({})
-    assert analyzer.classify(det) == Gesture.REPOUSO
+@pytest.mark.parametrize(
+    "case",
+    TEST_CASES["gesture_classification"],
+    ids=[c["name"] for c in TEST_CASES["gesture_classification"]]
+)
+def test_gesture_classification(analyzer, case):
+    """Testa a classificação de gestos a partir de casos definidos em JSON."""
+    det = create_mock_detection(case["kps_overrides"])
+    expected_gesture = Gesture(case["expected_gesture"])
+    assert analyzer.classify(det) == expected_gesture
 
-def test_classify_subir(analyzer):
-    """Pulsos acima dos ombros."""
-    det = create_mock_detection({
-        KP.LEFT_WRIST:  (150, 150, 1.0),
-        KP.RIGHT_WRIST: (250, 150, 1.0),
-    })
-    assert analyzer.classify(det) == Gesture.SUBIR
-
-def test_classify_descer(analyzer):
-    """Pulsos abaixo dos quadris."""
-    det = create_mock_detection({
-        KP.LEFT_WRIST:  (150, 350, 1.0),
-        KP.RIGHT_WRIST: (250, 350, 1.0),
-    })
-    assert analyzer.classify(det) == Gesture.DESCER
-
-def test_classify_low_conf(analyzer):
-    """Deve ignorar keypoints com baixa confiança."""
-    det = create_mock_detection({
-        KP.LEFT_WRIST:  (150, 150, 0.1), # Baixa confiança -> ignorado
-        KP.RIGHT_WRIST: (250, 350, 1.0), # Abaixo do quadril
-    })
-    # Como um pulso está visível e abaixo do quadril, o gesto é DESCER
-    assert analyzer.classify(det) == Gesture.DESCER
-
-def test_classify_no_wrists(analyzer):
-    """Sem pulsos visíveis, deve ser REPOUSO."""
-    det = create_mock_detection({
-        KP.LEFT_WRIST:  (150, 150, 0.1),
-        KP.RIGHT_WRIST: (250, 150, 0.1),
-    })
-    assert analyzer.classify(det) == Gesture.REPOUSO
-
-
-# Testes do Coeficiente de Velocidade
-
-def test_speed_coeff_repouso():
-    det = create_mock_detection({})
+@pytest.mark.parametrize(
+    "case",
+    TEST_CASES["speed_coefficient"],
+    ids=[c["name"] for c in TEST_CASES["speed_coefficient"]]
+)
+def test_speed_coefficient(case):
+    """Testa o cálculo do coeficiente de velocidade a partir de casos definidos em JSON."""
+    det = create_mock_detection(case["kps_overrides"])
     kf = KalmanPerson()
     kf.update(det.kps, dt=0.03)
-    assert compute_speed_coeff(det, kf, Gesture.REPOUSO) == 0.0
-
-def test_speed_coeff_subir():
-    # Pulsos bem acima dos ombros (y=100) vs ombros (y=200)
-    # dist = 200 - 100 = 100
-    # shoulder_width = 250 - 150 = 100
-    # speed = 100 / (1.5 * 100) = 0.666...
-    det = create_mock_detection({
-        KP.LEFT_WRIST:  (150, 100, 1.0),
-        KP.RIGHT_WRIST: (250, 100, 1.0),
-    })
-    kf = KalmanPerson()
     kf.update(det.kps, dt=0.03)
-    speed = compute_speed_coeff(det, kf, Gesture.SUBIR)
-    assert speed == pytest.approx(100.0 / (1.5 * 100.0))
-
-def test_speed_coeff_descer():
-    # Pulsos bem abaixo dos quadris (y=400) vs quadris (y=300)
-    # dist = 400 - 300 = 100
-    # hip_width = 240 - 160 = 80
-    # speed = 100 / (1.5 * 80) = 0.833...
-    det = create_mock_detection({
-        KP.LEFT_WRIST:  (160, 400, 1.0),
-        KP.RIGHT_WRIST: (240, 400, 1.0),
-    })
-    kf = KalmanPerson()
-    kf.update(det.kps, dt=0.03)
-    speed = compute_speed_coeff(det, kf, Gesture.DESCER)
-    assert speed == pytest.approx(100.0 / (1.5 * 80.0))
-
-def test_speed_coeff_clip():
-    """Testa se a velocidade é limitada em 1.0."""
-    # Distância muito grande
-    det = create_mock_detection({
-        KP.LEFT_WRIST:  (150, -100, 1.0),
-        KP.RIGHT_WRIST: (250, -100, 1.0),
-    })
-    kf = KalmanPerson()
-    kf.update(det.kps, dt=0.03)
-    speed = compute_speed_coeff(det, kf, Gesture.SUBIR)
-    assert speed == 1.0
+    gesture = Gesture(case["gesture"])
+    
+    speed = compute_speed_coeff(det, kf, gesture)
+    assert speed == pytest.approx(case["expected_speed"], abs=1e-6)
 
 
-# Testes da Agregação 
+# --- Testes de Lógica de Agregação e Kalman ---
 
 def test_majority_logic():
     assert _majority([Gesture.SUBIR, Gesture.SUBIR, Gesture.REPOUSO]) == "UP"
@@ -167,32 +104,30 @@ def test_confidence_logic():
     assert _confidence([Gesture.DESCER, Gesture.DESCER, Gesture.SUBIR], "UP") == pytest.approx(1/3)
     assert _confidence([], "REST") == 1.0
 
-def test_classify_all_aggregation():
-    # Criar detecções com posições X diferentes para garantir uma ordenação estável.
-    # A função `classify_all` ordena as detecções pela coordenada X do bbox.
-    # Usamos x_offset para garantir que os bboxes não se sobreponham em x.
-    # Para o gesto SUBIR, ambos os pulsos devem estar acima dos ombros para que a média funcione.
-    det_up1 = create_mock_detection({
-        KP.LEFT_WRIST: (160, 150, 1.0), KP.RIGHT_WRIST: (240, 150, 1.0)
-    }, x_offset=0)
-    det_up2 = create_mock_detection({
-        KP.LEFT_WRIST: (360, 140, 1.0), KP.RIGHT_WRIST: (440, 140, 1.0)
-    }, x_offset=200)
-    det_rest = create_mock_detection({}, x_offset=450)
-
-    dets = [det_up1, det_up2, det_rest]
+@pytest.mark.parametrize(
+    "case",
+    TEST_CASES["aggregation"],
+    ids=[c["name"] for c in TEST_CASES["aggregation"]]
+)
+def test_aggregation_scenarios(case):
+    """Testa a lógica de agregação com múltiplas pessoas a partir do JSON."""
+    dets = [
+        create_mock_detection(p["kps_overrides"], p["x_offset"])
+        for p in case["persons"]
+    ]
     analyzers = [GestureAnalyzer() for _ in range(len(dets))]
     kp_filters = [KalmanPerson() for _ in range(len(dets))]
 
     gestures, state, conf, speed, count = classify_all(
         dets, analyzers, kp_filters, dt=0.03
     )
-
-    assert gestures == [Gesture.SUBIR, Gesture.SUBIR, Gesture.REPOUSO]
-    assert state == "UP"
-    assert conf == pytest.approx(2/3)
-    assert count == 2
-    assert speed > 0.0
+    
+    expected_gestures = [Gesture(g) for g in case["expected_gestures"]]
+    assert gestures == expected_gestures
+    assert state == case["expected_state"]
+    assert conf == pytest.approx(case["expected_confidence"], abs=1e-6)
+    assert count == case["expected_count"]
+    assert (speed > 0) == case["check_speed_positive"]
 
 
 # Testes do Kalman 
