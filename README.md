@@ -1,9 +1,5 @@
 # 🌂 Projeto Guarda-Chuva
 
-# Resultado dos testes
-
-[![Status do QA Central](https://github.com/Projeto-Guarda-Chuva/.github/actions/workflows/qa-t32.yml/badge.svg)](https://github.com/Projeto-Guarda-Chuva/.github/actions/workflows/qa-t32.yml)
-
 # Detector de Gestos com YOLOv8-Pose
 
 Este projeto implementa um sistema de detecção de gestos em tempo real utilizando um modelo YOLOv8-Pose no formato ONNX. Ele é capaz de identificar pessoas em um stream de vídeo, analisar a posição de seus pulsos em relação aos ombros e quadris para classificar gestos como "SUBIR", "DESCER" ou "REPOUSO", e calcular um coeficiente de velocidade para os movimentos.
