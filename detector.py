@@ -39,7 +39,7 @@ class PrepResult:
     tensor:   np.ndarray        # shape (1, 3, H, W), float32
     scale:    float             # fator de escala aplicado
     pad_left: int               # padding horizontal (px)
-    pad_top:  int               # padding vertical (px)
+    pad_top:  int             # padding vertical (px)
     net_h:    int
     net_w:    int
 

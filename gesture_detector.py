@@ -26,10 +26,11 @@ sys.path.insert(0, os.path.dirname(__file__))
 from config import (
     PIPE_PATH, CONF_THRESHOLD, NMS_IOU, MAX_PERSONS,
     FRAME_QUEUE_MAX_SIZE, LOG_INTERVAL, WINDOW_NAME, WINDOW_W, WINDOW_H,
-    KP_CONF_THRESHOLD,
+    KP_CONF_THRESHOLD, CENTROIDS_FILE,
 )
 from detector import OnnxBackend, preprocess, postprocess
 from gesture_analyzer import GestureAnalyzer, classify_all
+from jsonio import atomic_write_json
 from kalman import KalmanPerson
 from state import StateManager
 from visualizer import draw_skeleton, draw_bbox, draw_ref_lines, draw_hud
@@ -97,7 +98,7 @@ def read_frame(fd: int) -> tuple[np.ndarray, int] | None:
 # ── Loop principal ───────────────────────────────────────────────────────────
 
 def run(model_path: str, use_gpu: bool = False,
-        use_tensorrt: bool = False) -> int:
+        use_tensorrt: bool = False, headless: bool = False) -> int:
     running = True
 
     def _shutdown(sig, _frame):
@@ -120,15 +121,19 @@ def run(model_path: str, use_gpu: bool = False,
     analyzers  = [GestureAnalyzer()  for _ in range(MAX_PERSONS)]
     kp_filters = [KalmanPerson()     for _ in range(MAX_PERSONS)]
     queue:   deque[tuple[np.ndarray, int]] = deque(maxlen=FRAME_QUEUE_MAX_SIZE)
+    prev_bboxes: list = []   # bboxes do frame anterior por slot (rastreamento de identidade)
 
     # Abrir pipe (bloqueia até o Grupo 1 abrir o lado de escrita)
     log.info("Aguardando Grupo 1 (frame_interface)...")
     pipe_fd = os.open(PIPE_PATH, os.O_RDONLY)
     log.info("Grupo 1 conectado!")
 
-    # Janela de visualização
-    cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
-    cv2.resizeWindow(WINDOW_NAME, WINDOW_W, WINDOW_H)
+    # Janela de visualização (pulada em modo headless)
+    if headless:
+        log.info("Modo headless — sem janela de visualização")
+    else:
+        cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
+        cv2.resizeWindow(WINDOW_NAME, WINDOW_W, WINDOW_H)
 
     frame_count       = 0
     frames_per_second = 0
@@ -165,32 +170,51 @@ def run(model_path: str, use_gpu: bool = False,
                     t_fps             = t_now
 
                 # Classificar gestos e atualizar estado
-                gestures, state, conf, speed, count = classify_all(
+                gestures, state, conf, speed, count, centroids, prev_bboxes, ordered_dets = classify_all(
                     dets, analyzers, kp_filters, dt, KP_CONF_THRESHOLD,
+                    prev_bboxes=prev_bboxes,
                 )
                 state_mgr.update(state, conf, speed, count)
 
-                # Visualização
-                vis = frame.copy()
-                n   = min(len(dets), MAX_PERSONS)
-                for i in range(n):
-                    sy, hy = analyzers[i].ref_ys(dets[i])
-                    draw_skeleton(vis, dets[i])
-                    draw_ref_lines(vis, dets[i], sy, hy)
-                    draw_bbox(vis, dets[i], gestures[i], i + 1)
-                draw_hud(vis, display_fps, frame_count,
-                         state, conf, speed, count)
-                cv2.imshow(WINDOW_NAME, vis)
+                # JSON de centroides
+                if centroids:
+                    avg_cx = round(sum(cx for cx, _ in centroids) / len(centroids), 1)
+                    avg_cy = round(sum(cy for _, cy in centroids) / len(centroids), 1)
+                else:
+                    avg_cx = avg_cy = None
+
+                centroids_data = {
+                    "frame": frame_count,
+                    "persons": [
+                        {"slot": i, "cx": round(cx, 1), "cy": round(cy, 1)}
+                        for i, (cx, cy) in enumerate(centroids)
+                    ],
+                    "avg": {"cx": avg_cx, "cy": avg_cy},
+                }
+                atomic_write_json(CENTROIDS_FILE, centroids_data)
+
+                # Visualização (pulada em modo headless)
+                if not headless:
+                    vis = frame.copy()
+                    for i, det_vis in enumerate(ordered_dets):
+                        sy, hy = analyzers[i].ref_ys(det_vis)
+                        draw_skeleton(vis, det_vis)
+                        draw_ref_lines(vis, det_vis, sy, hy)
+                        draw_bbox(vis, det_vis, gestures[i], i + 1)
+                    draw_hud(vis, display_fps, frame_count,
+                             state, conf, speed, count)
+                    cv2.imshow(WINDOW_NAME, vis)
 
                 if frame_count % LOG_INTERVAL == 0:
                     log.info("Frame %d  FPS=%.0f  %s  conf=%.0f%%  speed=%.2f  n=%d/%d",
                              frame_count, display_fps, state,
-                             conf * 100, speed, count, n)
+                             conf * 100, speed, count, len(ordered_dets))
 
-            key = cv2.waitKey(1) & 0xFF
-            if key in (27, ord("q")):
-                running = False
-                break
+            if not headless:
+                key = cv2.waitKey(1) & 0xFF
+                if key in (27, ord("q")):
+                    running = False
+                    break
 
             # ── Ler próximo frame do pipe ────────────────────────────────
             result = read_frame(pipe_fd)
@@ -202,7 +226,8 @@ def run(model_path: str, use_gpu: bool = False,
     finally:
         state_mgr.stop()
         os.close(pipe_fd)
-        cv2.destroyAllWindows()
+        if not headless:
+            cv2.destroyAllWindows()
 
     elapsed = time.monotonic() - t_start
     log.info("Encerrado — %d frames em %.1f s (%.1f FPS médio)",
@@ -217,9 +242,12 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("model", help="Caminho para o modelo .onnx")
     p.add_argument("--gpu",       action="store_true", help="Usar CUDA EP")
     p.add_argument("--tensorrt",  action="store_true", help="Usar TensorRT EP")
+    p.add_argument("--headless",  action="store_true",
+                   help="Sem janela OpenCV (necessário sem display/X11)")
     return p.parse_args()
 
 
 if __name__ == "__main__":
     args = _parse_args()
-    sys.exit(run(args.model, use_gpu=args.gpu, use_tensorrt=args.tensorrt))
+    sys.exit(run(args.model, use_gpu=args.gpu, use_tensorrt=args.tensorrt,
+                  headless=args.headless))

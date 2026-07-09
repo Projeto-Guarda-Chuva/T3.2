@@ -4,14 +4,30 @@
 # Visão computacional
 opencv-python>=4.8
 
-# Inferência ONNX Runtime
-# CPU only:
+# Álgebra linear
+# Travado em <2.0: wheels de onnxruntime-gpu para Jetson costumam ser
+# compiladas contra NumPy 1.x — NumPy 2.x pode causar erro de ABI
+# ("numpy.dtype size changed") ao importar onnxruntime.
+numpy>=1.24,<2.0
+
+# ── Inferência ONNX Runtime ─────────────────────────────────────────────
+#
+# CPU only (desenvolvimento em PC sem GPU compatível):
 onnxruntime>=1.18
-# GPU (Jetson / CUDA) — instalar UM dos dois, não ambos:
-# onnxruntime-gpu>=1.18
-
-# Álgebra linear (geralmente já disponível)
-numpy>=1.24
-
-# Testes
-pytest>=8.0
+#
+# GPU (Jetson): NÃO instale via este arquivo. Não existe wheel
+# onnxruntime-gpu publicada no PyPI para aarch64 — "pip install
+# onnxruntime-gpu" numa Jetson falha ou instala algo incompatível.
+#
+# Passos no Jetson (dentro do venv já ativado):
+#   1. sudo apt install nvidia-jetpack        (cuDNN + TensorRT no sistema)
+#   2. pip uninstall onnxruntime              (remove a versão CPU acima)
+#   3. Baixe a wheel correta para sua combinação exata de
+#      JetPack + Python + CUDA + TensorRT (ex: JetPack 6.2.1, cp310,
+#      CUDA 12.6, aarch64) de um repositório compatível com Jetson Orin.
+#   4. pip install ./onnxruntime_gpu-<versao>-cp310-cp310-linux_aarch64.whl
+#   5. Confirme com:
+#        python -c "import onnxruntime as ort; print(ort.get_available_providers())"
+#      Deve listar TensorrtExecutionProvider e CUDAExecutionProvider.
+#
+websocket-client
