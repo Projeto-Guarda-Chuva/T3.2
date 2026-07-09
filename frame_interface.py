@@ -1,9 +1,12 @@
-# frame_interface.py (substituído completamente)
 """
-Interface de Frames — Grupo 1 (Câmera Local)
-===============================================
-Captura frames da câmera local conectada à Jetson Orin Nano
-e os envia via named pipe para o processo de inferência (Grupo 2).
+Interface de Frames — Grupo 1
+==============================
+Captura frames do servidor de câmeras via WebSocket e os envia via named
+pipe para o processo de inferência (Grupo 2).
+
+O servidor expõe um WebSocket por câmera em ws://<host>:<port>/ws/<key>
+(chaves conhecidas: "emeet", "fifine"), enviando cada frame como uma
+mensagem binária JPEG.
 
 Protocolo do pipe:
     [4 bytes: magic 0x47525544]
@@ -14,12 +17,14 @@ Protocolo do pipe:
     [width × height × 3 bytes: BGR raw]
 """
 
+import argparse
 import logging
 import os
 import signal
 import struct
 import sys
 import time
+from urllib.parse import urlparse
 
 import cv2
 import numpy as np
@@ -27,10 +32,8 @@ import numpy as np
 # Adicionar o diretório do pacote ao path
 sys.path.insert(0, os.path.dirname(__file__))
 
-from config import (
-    PIPE_PATH, FPS_LIMIT,
-    CAMERA_DEVICE, CAMERA_WIDTH, CAMERA_HEIGHT, CAMERA_FPS, CAMERA_BUFFERSIZE,
-)
+from config import HTTP_URL, PIPE_PATH, FPS_LIMIT
+from http_stream import WebSocketVideoStream
 
 logging.basicConfig(
     level=logging.INFO,
@@ -42,7 +45,20 @@ log = logging.getLogger("frame_interface")
 FRAME_MAGIC        = 0x47525544
 HEADER_FORMAT      = "<IIIII Q"       # magic, frame_id, w, h, channels, timestamp_us
 HEADER_SIZE        = struct.calcsize(HEADER_FORMAT)
+MAX_PIPE_BUFFER    = 10               # frames máximos no pipe antes de throttle
 MAX_CONSEC_ERRORS  = 10
+
+
+def build_ws_url(base_url: str, camera: str) -> str:
+    """
+    Monta a URL do WebSocket a partir da URL base do servidor (HTTP_URL,
+    ex: http://172.18.4.56:443) e da chave da câmera (ex: 'emeet').
+    Resulta em: ws://172.18.4.56:443/ws/emeet
+    """
+    parsed = urlparse(base_url)
+    scheme = "wss" if parsed.scheme == "https" else "ws"
+    netloc = parsed.netloc or parsed.path  # tolera URL sem esquema
+    return f"{scheme}://{netloc}/ws/{camera}"
 
 
 def encode_frame(frame: np.ndarray, frame_id: int) -> bytes:
@@ -64,52 +80,10 @@ def create_pipe(path: str) -> None:
     log.info("Pipe criado: %s", path)
 
 
-def init_camera(device: int, width: int, height: int, fps: int) -> cv2.VideoCapture:
-    """
-    Inicializa a câmera com as configurações otimizadas para Jetson.
-    """
-    # Tentar usar GStreamer para melhor performance no Jetson
-    # Caso não funcione, fallback para V4L2
-    try:
-        # Pipeline GStreamer otimizado para Jetson
-        gst_pipeline = (
-            f"v4l2src device=/dev/video{device} ! "
-            f"video/x-raw,width={width},height={height},framerate={fps}/1 ! "
-            "nvvidconv ! "
-            "video/x-raw,format=BGRx ! "
-            "videoconvert ! "
-            "video/x-raw,format=BGR ! "
-            "appsink drop=1 max-buffers=1"
-        )
-        cap = cv2.VideoCapture(gst_pipeline, cv2.CAP_GSTREAMER)
-        if cap.isOpened():
-            log.info("Câmera inicializada com GStreamer: /dev/video%d", device)
-            return cap
-    except Exception as e:
-        log.warning("Falha ao inicializar GStreamer: %s", e)
-
-    # Fallback para V4L2 (OpenCV padrão)
-    cap = cv2.VideoCapture(device)
-    if not cap.isOpened():
-        raise RuntimeError(f"Não foi possível abrir a câmera /dev/video{device}")
-
-    # Configurações otimizadas
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
-    cap.set(cv2.CAP_PROP_FPS, fps)
-    cap.set(cv2.CAP_PROP_BUFFERSIZE, CAMERA_BUFFERSIZE)
-    # Desativar auto-exposição para menor latência (opcional)
-    # cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 1)
-
-    log.info("Câmera inicializada com V4L2: /dev/video%d", device)
-    return cap
-
-
 # ── Loop principal ───────────────────────────────────────────────────────────
 
-def run(pipe_path: str = PIPE_PATH,
-        fps_limit: int = FPS_LIMIT,
-        camera_device: int = CAMERA_DEVICE) -> int:
+def run(ws_url: str, pipe_path: str = PIPE_PATH,
+        fps_limit: int = FPS_LIMIT) -> int:
     running    = True
     frame_id   = 0
     errors     = 0
@@ -126,9 +100,8 @@ def run(pipe_path: str = PIPE_PATH,
     signal.signal(signal.SIGTERM, _shutdown)
     signal.signal(signal.SIGPIPE, signal.SIG_IGN)
 
+    log.info("URL: %s", ws_url)
     log.info("Pipe: %s", pipe_path)
-    log.info("Câmera: /dev/video%d (%dx%d @ %d fps)",
-             camera_device, CAMERA_WIDTH, CAMERA_HEIGHT, CAMERA_FPS)
 
     # Criar pipe e aguardar o Grupo 2 abrir a leitura
     create_pipe(pipe_path)
@@ -136,30 +109,26 @@ def run(pipe_path: str = PIPE_PATH,
     pipe_fd = os.open(pipe_path, os.O_WRONLY)  # bloqueia até o leitor conectar
     log.info("Grupo 2 conectado!")
 
-    # Inicializar câmera
-    try:
-        cap = init_camera(camera_device, CAMERA_WIDTH, CAMERA_HEIGHT, CAMERA_FPS)
-    except RuntimeError as e:
-        log.error("%s", e)
+    stream = WebSocketVideoStream(ws_url)
+    if not stream.connect():
+        log.error("Falha ao conectar ao servidor WebSocket")
         os.close(pipe_fd)
         return 1
-
-    log.info("Captura iniciada")
+    log.info("Stream WebSocket conectado")
 
     try:
         while running:
             t_loop = time.monotonic()
 
-            # Ler frame da câmera
-            ret, frame = cap.read()
+            frame = stream.read()
 
-            if not ret or frame is None:
+            if frame is None:
                 errors += 1
                 log.warning("Frame vazio (%d/%d)", errors, MAX_CONSEC_ERRORS)
                 if errors >= MAX_CONSEC_ERRORS:
                     log.error("Muitos erros consecutivos — encerrando")
                     break
-                time.sleep(0.05)
+                time.sleep(0.1)
                 continue
 
             errors    = 0
@@ -191,7 +160,7 @@ def run(pipe_path: str = PIPE_PATH,
                 time.sleep(sleep_for)
 
     finally:
-        cap.release()
+        stream.disconnect()
         os.close(pipe_fd)
         try:
             os.unlink(pipe_path)
@@ -204,5 +173,23 @@ def run(pipe_path: str = PIPE_PATH,
     return 0
 
 
+def _parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Interface de Frames — Grupo 1")
+    p.add_argument("--url", default=None,
+                   help="URL completa do WebSocket (ex: ws://172.18.4.56:443/ws/emeet). "
+                        "Se omitido, é montada a partir de --base-url e --camera.")
+    p.add_argument("--base-url", default=HTTP_URL,
+                   help=f"URL base do servidor de câmeras (padrão: {HTTP_URL})")
+    p.add_argument("--camera", default="emeet", choices=["emeet", "fifine"],
+                   help="Câmera a usar quando --url não é informado (padrão: emeet)")
+    p.add_argument("--pipe", default=PIPE_PATH,
+                   help=f"Caminho do named pipe (padrão: {PIPE_PATH})")
+    p.add_argument("--fps", type=int, default=FPS_LIMIT,
+                   help=f"Limite de FPS (padrão: {FPS_LIMIT})")
+    return p.parse_args()
+
+
 if __name__ == "__main__":
-    sys.exit(run())
+    args = _parse_args()
+    url = args.url or build_ws_url(args.base_url, args.camera)
+    sys.exit(run(url, args.pipe, args.fps))

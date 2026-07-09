@@ -14,9 +14,12 @@ from gesture_analyzer import Gesture
 
 def gesture_color(gesture: Gesture) -> tuple[int, int, int]:
     return {
-        Gesture.SUBIR:   (0, 220, 0),
-        Gesture.DESCER:  (0, 60,  220),
-        Gesture.REPOUSO: (180, 180, 180),
+        Gesture.SUBIR:     (0,   220,   0),    # verde
+        Gesture.DESCER:    (0,    60, 220),    # azul
+        Gesture.FECHAR:    (0,   200, 200),    # ciano
+        Gesture.MUDAR_LED: (220, 140,   0),    # laranja
+        Gesture.OPEN:      (180,   0, 220),    # roxo
+        Gesture.REPOUSO:   (180, 180, 180),    # cinza
     }[gesture]
 
 

@@ -5,7 +5,6 @@ Gerenciamento do estado global do programa.
 - StateManager: escrita periódica do JSON e acesso thread-safe
 """
 
-import json
 import logging
 import threading
 import time
@@ -13,6 +12,7 @@ from dataclasses import dataclass, asdict, field
 from pathlib import Path
 
 from config import STATE_FILE, STATE_UPDATE_INTERVAL
+from jsonio import atomic_write_json
 
 log = logging.getLogger(__name__)
 
@@ -56,10 +56,7 @@ class StateManager:
     def write_now(self) -> None:
         with self._lock:
             state = asdict(self._state)
-        try:
-            self._path.write_text(json.dumps(state, indent=2) + "\n")
-        except OSError as e:
-            log.warning("Não foi possível escrever estado: %s", e)
+        atomic_write_json(str(self._path), state)
 
     # ── Thread de background ────────────────────────────────────────────────
 

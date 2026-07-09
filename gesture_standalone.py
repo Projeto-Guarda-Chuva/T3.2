@@ -25,9 +25,11 @@ sys.path.insert(0, os.path.dirname(__file__))
 from config import (
     CONF_THRESHOLD, NMS_IOU, MAX_PERSONS,
     LOG_INTERVAL, WINDOW_NAME, WINDOW_W, WINDOW_H, KP_CONF_THRESHOLD,
+    CENTROIDS_FILE,
 )
 from detector import OnnxBackend, preprocess, postprocess
 from gesture_analyzer import GestureAnalyzer, classify_all
+from jsonio import atomic_write_json
 from kalman import KalmanPerson
 from state import StateManager
 from visualizer import (
@@ -64,7 +66,8 @@ def open_source(source: str) -> tuple[cv2.VideoCapture, bool]:
 # ── Loop principal ───────────────────────────────────────────────────────────
 
 def run(model_path: str, source: str = "",
-        use_gpu: bool = False, use_tensorrt: bool = False) -> int:
+        use_gpu: bool = False, use_tensorrt: bool = False,
+        headless: bool = False) -> int:
     running = True
 
     def _shutdown(sig, _frame):
@@ -84,6 +87,7 @@ def run(model_path: str, source: str = "",
 
     analyzers  = [GestureAnalyzer()  for _ in range(MAX_PERSONS)]
     kp_filters = [KalmanPerson()     for _ in range(MAX_PERSONS)]
+    prev_bboxes: list = []   # bboxes do frame anterior por slot (rastreamento de identidade)
 
     cap, is_webcam = open_source(source)
     if not cap.isOpened():
@@ -101,8 +105,11 @@ def run(model_path: str, source: str = "",
              cap.get(cv2.CAP_PROP_FRAME_HEIGHT),
              src_fps)
 
-    cv2.namedWindow(f"{WINDOW_NAME} [Standalone]", cv2.WINDOW_NORMAL)
-    cv2.resizeWindow(f"{WINDOW_NAME} [Standalone]", WINDOW_W, WINDOW_H)
+    if headless:
+        log.info("Modo headless — sem janela de visualização")
+    else:
+        cv2.namedWindow(f"{WINDOW_NAME} [Standalone]", cv2.WINDOW_NORMAL)
+        cv2.resizeWindow(f"{WINDOW_NAME} [Standalone]", WINDOW_W, WINDOW_H)
 
     frame_count       = 0
     frames_per_second = 0
@@ -112,13 +119,14 @@ def run(model_path: str, source: str = "",
     t_last_frame      = t_start
     paused            = False
 
-    log.info("=== PROCESSANDO ===  (q/ESC para sair%s)",
-             "  ESPAÇO para pausar" if not is_webcam else "")
+    log.info("=== PROCESSANDO ===%s",
+             "" if headless else
+             f"  (q/ESC para sair{'  ESPAÇO para pausar' if not is_webcam else ''})")
 
     try:
         while running:
-            # ── Pausa (só para arquivo) ──────────────────────────────────
-            if paused:
+            # ── Pausa (só para arquivo, requer janela) ───────────────────
+            if paused and not headless:
                 key = cv2.waitKey(30) & 0xFF
                 if key == ord(" "):
                     paused = False
@@ -158,41 +166,61 @@ def run(model_path: str, source: str = "",
                 t_fps             = t_now
 
             # ── Classificar gestos ────────────────────────────────────────
-            gestures, state, conf, speed, count = classify_all(
+            gestures, state, conf, speed, count, centroids, prev_bboxes, ordered_dets = classify_all(
                 dets, analyzers, kp_filters, dt, KP_CONF_THRESHOLD,
+                prev_bboxes=prev_bboxes,
             )
             state_mgr.update(state, conf, speed, count)
 
-            # ── Visualização ──────────────────────────────────────────────
-            vis = frame.copy()
-            n   = min(len(dets), MAX_PERSONS)
-            for i in range(n):
-                sy, hy = analyzers[i].ref_ys(dets[i])
-                draw_skeleton(vis, dets[i])
-                draw_ref_lines(vis, dets[i], sy, hy)
-                draw_bbox(vis, dets[i], gestures[i], i + 1)
+            # ── JSON de centroides ────────────────────────────────────────
+            if centroids:
+                avg_cx = round(sum(cx for cx, _ in centroids) / len(centroids), 1)
+                avg_cy = round(sum(cy for _, cy in centroids) / len(centroids), 1)
+            else:
+                avg_cx = avg_cy = None
 
-            if not is_webcam and total_frames > 0:
-                draw_progress_bar(vis, frame_count, total_frames)
+            centroids_data = {
+                "frame": frame_count,
+                "t_sec": round(frame_count / src_fps, 3),
+                "persons": [
+                    {"slot": i, "cx": round(cx, 1), "cy": round(cy, 1)}
+                    for i, (cx, cy) in enumerate(centroids)
+                ],
+                "avg": {"cx": avg_cx, "cy": avg_cy},
+            }
+            atomic_write_json(CENTROIDS_FILE, centroids_data)
 
-            draw_hud(vis, display_fps, frame_count,
-                     state, conf, speed, count,
-                     source_label=src_label)
+            # ── Visualização (pulada em modo headless) ───────────────────
+            if not headless:
+                vis = frame.copy()
+                for i, det_vis in enumerate(ordered_dets):
+                    sy, hy = analyzers[i].ref_ys(det_vis)
+                    draw_skeleton(vis, det_vis)
+                    draw_ref_lines(vis, det_vis, sy, hy)
+                    draw_bbox(vis, det_vis, gestures[i], i + 1)
 
-            cv2.imshow(f"{WINDOW_NAME} [Standalone]", vis)
+                if not is_webcam and total_frames > 0:
+                    draw_progress_bar(vis, frame_count, total_frames)
+
+                draw_hud(vis, display_fps, frame_count,
+                         state, conf, speed, count,
+                         source_label=src_label)
+
+                cv2.imshow(f"{WINDOW_NAME} [Standalone]", vis)
 
             if frame_count % LOG_INTERVAL == 0:
                 log.info("Frame %d  FPS=%.0f  %s  conf=%.0f%%  speed=%.2f  n=%d/%d",
                          frame_count, display_fps, state,
-                         conf * 100, speed, count, n)
+                         conf * 100, speed, count, len(ordered_dets))
 
-            # ── Teclas ───────────────────────────────────────────────────
-            key = cv2.waitKey(1) & 0xFF
-            if key in (27, ord("q")):
-                running = False
-                break
-            if key == ord(" ") and not is_webcam:
-                paused = True
+            # ── Teclas (requer janela; em headless, só Ctrl+C encerra) ───
+            if not headless:
+                key = cv2.waitKey(1) & 0xFF
+                if key in (27, ord("q")):
+                    running = False
+                    break
+                if key == ord(" ") and not is_webcam:
+                    paused = True
 
             # ── Throttle para vídeo pré-gravado ──────────────────────────
             if not is_webcam:
@@ -204,7 +232,8 @@ def run(model_path: str, source: str = "",
     finally:
         state_mgr.stop()
         cap.release()
-        cv2.destroyAllWindows()
+        if not headless:
+            cv2.destroyAllWindows()
 
     elapsed = time.monotonic() - t_start
     log.info("Encerrado — %d frames em %.1f s (%.1f FPS médio)",
@@ -222,9 +251,11 @@ def _parse_args() -> argparse.Namespace:
                         "caminho = arquivo (padrão: '')")
     p.add_argument("--gpu",       action="store_true", help="Usar CUDA EP")
     p.add_argument("--tensorrt",  action="store_true", help="Usar TensorRT EP")
+    p.add_argument("--headless",  action="store_true",
+                   help="Sem janela OpenCV (necessário sem display/X11)")
     return p.parse_args()
 
 
 if __name__ == "__main__":
     args = _parse_args()
-    sys.exit(run(args.model, args.source, args.gpu, args.tensorrt))
+    sys.exit(run(args.model, args.source, args.gpu, args.tensorrt, args.headless))
